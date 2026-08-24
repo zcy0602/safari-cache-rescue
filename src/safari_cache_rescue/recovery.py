@@ -1,0 +1,407 @@
+import hashlib
+import html
+import json
+import os
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
+
+from .history import HistoryReader, HistoryUnavailable
+from .models import BlobSource, Candidate, HistoryEntry
+
+
+MAX_HTML_BYTES = 64 * 1024 * 1024
+_TITLE = re.compile(r"(?is)<title[^>]*>(.*?)</title>")
+_TAG = re.compile(r"(?s)<[^>]+>")
+_CANONICAL = re.compile(
+    r"(?is)<link[^>]+rel=[\"']?canonical[\"']?[^>]+href=[\"']([^\"']+)[\"']"
+)
+_WORD = re.compile(r"\w+", re.UNICODE)
+
+
+class CacheUnavailable(RuntimeError):
+    pass
+
+
+class CandidateUnavailable(RuntimeError):
+    pass
+
+
+class ExportFailure(RuntimeError):
+    pass
+
+
+def default_history_path(home: Optional[Path] = None) -> Path:
+    base = home or Path.home()
+    return base / "Library" / "Safari" / "History.db"
+
+
+def default_cache_roots(home: Optional[Path] = None) -> List[Path]:
+    base = home or Path.home()
+    return [
+        base / "Library" / "Caches" / "com.apple.Safari" / "WebKitCache",
+        base
+        / "Library"
+        / "Containers"
+        / "com.apple.Safari"
+        / "Data"
+        / "Library"
+        / "Caches"
+        / "com.apple.Safari"
+        / "WebKitCache",
+    ]
+
+
+def normalize(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def meaningful_tokens(value: str) -> List[str]:
+    return list(dict.fromkeys(token.casefold() for token in _WORD.findall(value) if len(token) >= 2))
+
+
+def decode_html(data: bytes) -> Optional[str]:
+    prefix = data[:65536]
+    encodings = []
+    if prefix.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encodings.append("utf-16")
+    elif prefix.startswith(b"\xef\xbb\xbf"):
+        encodings.append("utf-8-sig")
+    encodings.append("utf-8")
+    for encoding in encodings:
+        try:
+            text = data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        lowered = text[:65536].casefold()
+        if any(marker in lowered for marker in ("<!doctype html", "<html", "<head", "<title")):
+            return text
+    return None
+
+
+def looks_like_html(data: bytes) -> bool:
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        prefix = data.decode("utf-16", errors="ignore")
+    else:
+        prefix = data.decode("utf-8-sig", errors="ignore")
+    lowered = prefix.casefold()
+    return any(marker in lowered for marker in ("<!doctype html", "<html", "<head", "<title"))
+
+
+def extract_title(text: str) -> str:
+    match = _TITLE.search(text)
+    if not match:
+        return ""
+    return " ".join(html.unescape(_TAG.sub("", match.group(1))).split())
+
+
+def is_complete_html(text: str) -> bool:
+    lowered = text.casefold()
+    return "</html>" in lowered and ("</body>" in lowered or "<body" not in lowered)
+
+
+def domain_from_url(value: str) -> str:
+    try:
+        return (urlparse(value).hostname or "").casefold()
+    except ValueError:
+        return ""
+
+
+def domain_from_html(text: str) -> str:
+    canonical = _CANONICAL.search(text)
+    if canonical:
+        return domain_from_url(html.unescape(canonical.group(1)))
+    return ""
+
+
+def read_stable(path: Path) -> Optional[bytes]:
+    try:
+        before = path.stat()
+        if before.st_size <= 0 or before.st_size > MAX_HTML_BYTES:
+            return None
+        with path.open("rb") as handle:
+            prefix = handle.read(65536)
+            if not looks_like_html(prefix):
+                return None
+            handle.seek(0)
+            data = handle.read()
+        after = path.stat()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+    identity_before = (before.st_ino, before.st_size, before.st_mtime_ns)
+    identity_after = (after.st_ino, after.st_size, after.st_mtime_ns)
+    return data if identity_before == identity_after and len(data) == before.st_size else None
+
+
+class RecoveryEngine:
+    def __init__(
+        self,
+        history_path: Optional[Path] = None,
+        cache_roots: Optional[Sequence[Path]] = None,
+    ):
+        self.history = HistoryReader(history_path or default_history_path())
+        self.cache_roots = list(cache_roots or default_cache_roots())
+        self.warnings: List[str] = []
+        self._history_accessible = True
+
+    def blob_sources(self) -> List[BlobSource]:
+        sources: List[BlobSource] = []
+        denied = 0
+        readable_root = False
+        for root in self.cache_roots:
+            try:
+                if not root.exists():
+                    continue
+                with os.scandir(root):
+                    pass
+                readable_root = True
+                version_dirs = sorted(root.glob("Version */Blobs"))
+            except (PermissionError, OSError):
+                denied += 1
+                continue
+            for blobs_dir in version_dirs:
+                try:
+                    with os.scandir(blobs_dir) as entries:
+                        for entry in entries:
+                            if entry.is_file(follow_symlinks=False):
+                                sources.append(
+                                    BlobSource(Path(entry.path), blobs_dir.parent.name)
+                                )
+                except (PermissionError, OSError):
+                    denied += 1
+        if denied and sources:
+            self.warnings.append("One Safari cache location could not be read")
+        if not sources and denied and not readable_root:
+            raise CacheUnavailable(
+                "Safari cache could not be read; grant Full Disk Access to this terminal app"
+            )
+        if not sources:
+            raise CacheUnavailable("no Safari WebKit cache blobs were found")
+        return sources
+
+    def _history_entries(
+        self,
+        query: Optional[str],
+        start: Optional[datetime],
+        end: Optional[datetime],
+        required: bool,
+    ) -> List[HistoryEntry]:
+        try:
+            return self.history.entries(query=query, start=start, end=end)
+        except HistoryUnavailable as error:
+            self._history_accessible = False
+            if required:
+                raise
+            self.warnings.append("History unavailable; using cache-only matching: {}".format(error))
+            return []
+
+    def find(
+        self,
+        query: str,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ) -> List[Candidate]:
+        entries = self._history_entries(query, start, end, required=False)
+        time_filter_requested = start is not None or end is not None
+        if time_filter_requested and not self._history_accessible:
+            self.warnings.append("The requested time filter could not be applied without Safari History")
+        return self._scan(
+            query,
+            entries,
+            recent_mode=False,
+            require_history_match=time_filter_requested and self._history_accessible,
+        )
+
+    def recent(self, start: datetime, end: datetime) -> List[Candidate]:
+        entries = self._history_entries(None, start, end, required=True)
+        return self._scan(None, entries, recent_mode=True, require_history_match=True)
+
+    def _scan(
+        self,
+        query: Optional[str],
+        entries: Sequence[HistoryEntry],
+        recent_mode: bool,
+        require_history_match: bool,
+    ) -> List[Candidate]:
+        candidates: Dict[str, Candidate] = {}
+        query_normalized = normalize(query or "")
+        query_domain = domain_from_url(query or "")
+        is_url_query = bool(query_domain)
+        query_tokens = [] if is_url_query else meaningful_tokens(query or "")
+
+        for source in self.blob_sources():
+            data = read_stable(source.path)
+            if data is None:
+                continue
+            text = decode_html(data)
+            if text is None:
+                continue
+            title = extract_title(text)
+            lowered = text.casefold()
+            normalized_title = normalize(title)
+            complete = is_complete_html(text)
+            reasons: List[str] = []
+            matched_entries: List[HistoryEntry] = []
+
+            exact_url = False
+            exact_title = False
+            title_overlap = False
+            for entry in entries:
+                if entry.url and entry.url.casefold() in lowered:
+                    exact_url = True
+                    matched_entries.append(entry)
+                    reasons.append("exact URL present in HTML")
+                if title and entry.title and normalized_title == normalize(entry.title):
+                    exact_title = True
+                    matched_entries.append(entry)
+                    reasons.append("HTML title matches Safari history")
+                elif title and entry.title:
+                    history_title = normalize(entry.title)
+                    title_tokens = set(meaningful_tokens(title))
+                    history_tokens = set(meaningful_tokens(entry.title))
+                    overlap = title_tokens & history_tokens
+                    overlap_ratio = len(overlap) / max(len(title_tokens), len(history_tokens), 1)
+                    if (
+                        (len(overlap) >= 2 and overlap_ratio >= 0.75)
+                        or (len(normalized_title) >= 6 and normalized_title in history_title)
+                        or (len(history_title) >= 6 and history_title in normalized_title)
+                    ):
+                        title_overlap = True
+                        matched_entries.append(entry)
+                        reasons.append("HTML title overlaps Safari history")
+
+            literal_in_title = bool(
+                query_normalized and not is_url_query and query_normalized in normalized_title
+            )
+            literal_in_body = bool(query_normalized and query_normalized in lowered)
+            token_hits = sum(1 for token in query_tokens if token in lowered)
+            if literal_in_title:
+                reasons.append("query appears in HTML title")
+            elif literal_in_body:
+                reasons.append("query appears in HTML")
+            if token_hits >= 2:
+                reasons.append("multiple query terms appear in HTML")
+
+            if recent_mode or require_history_match:
+                relevant = exact_url or exact_title or title_overlap
+            else:
+                relevant = exact_url or exact_title or title_overlap or literal_in_body or token_hits > 0
+            if not relevant:
+                continue
+
+            if complete and (exact_url or exact_title):
+                confidence = "high"
+            elif complete and (title_overlap or literal_in_title or token_hits >= 2):
+                confidence = "medium"
+            else:
+                confidence = "low"
+                if not complete:
+                    reasons.append("HTML may be incomplete")
+
+            matched_entry = max(matched_entries, key=lambda item: item.visit_time) if matched_entries else None
+            domain = (
+                domain_from_url(matched_entry.url) if matched_entry else query_domain or domain_from_html(text)
+            )
+            digest = hashlib.sha256(data).hexdigest()
+            candidate = Candidate(
+                sha256=digest,
+                title=title,
+                domain=domain,
+                visit_time=matched_entry.visit_time if matched_entry else None,
+                byte_length=len(data),
+                cache_version=source.cache_version,
+                confidence=confidence,
+                match_reasons=list(dict.fromkeys(reasons)),
+                source=source,
+            )
+            existing = candidates.get(digest)
+            if existing is None or _confidence_rank(candidate.confidence) > _confidence_rank(existing.confidence):
+                candidates[digest] = candidate
+
+        return sorted(
+            candidates.values(),
+            key=lambda item: (
+                _confidence_rank(item.confidence),
+                item.visit_time.timestamp() if item.visit_time else 0,
+                item.byte_length,
+            ),
+            reverse=True,
+        )
+
+    def export(self, candidate_prefix: str, output: Path, force: bool = False) -> Tuple[Path, Path]:
+        prefix = candidate_prefix.casefold()
+        if len(prefix) < 12 or not all(character in "0123456789abcdef" for character in prefix):
+            raise CandidateUnavailable("candidate ID must be a hexadecimal prefix of at least 12 characters")
+
+        matches: Dict[str, Tuple[BlobSource, bytes, str]] = {}
+        for source in self.blob_sources():
+            data = read_stable(source.path)
+            if data is None:
+                continue
+            digest = hashlib.sha256(data).hexdigest()
+            if digest.startswith(prefix):
+                text = decode_html(data)
+                if text is not None:
+                    matches.setdefault(digest, (source, data, text))
+        if not matches:
+            raise CandidateUnavailable("candidate is no longer present in Safari cache")
+        if len(matches) > 1:
+            raise CandidateUnavailable("candidate ID prefix is ambiguous; provide more characters")
+        digest, (source, data, text) = next(iter(matches.items()))
+
+        report_path = Path(str(output) + ".recovery.json")
+        if not force and (output.exists() or report_path.exists()):
+            raise ExportFailure("output or recovery report already exists; use --force to replace it")
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        temporary = output.with_name(".{}.safari-rescue.tmp".format(output.name))
+        report_temporary = report_path.with_name(".{}.safari-rescue.tmp".format(report_path.name))
+        try:
+            with temporary.open("wb") as handle:
+                handle.write(data)
+            if hashlib.sha256(temporary.read_bytes()).hexdigest() != digest:
+                raise ExportFailure("exported bytes failed SHA-256 verification")
+
+            title = extract_title(text)
+            report = {
+                "candidate_id": digest,
+                "sha256": digest,
+                "title": title,
+                "domain": self._domain_for_title(title) or domain_from_html(text),
+                "cache_version": source.cache_version,
+                "byte_length": len(data),
+                "recovered_at": datetime.now().astimezone().isoformat(),
+            }
+            with report_temporary.open("w", encoding="utf-8") as handle:
+                json.dump(report, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            os.replace(temporary, output)
+            os.replace(report_temporary, report_path)
+        except (OSError, ExportFailure) as error:
+            for path in (temporary, report_temporary):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            if isinstance(error, ExportFailure):
+                raise
+            raise ExportFailure(str(error)) from error
+        return output, report_path
+
+    def _domain_for_title(self, title: str) -> str:
+        if not title:
+            return ""
+        try:
+            entries = self.history.entries(query=title)
+        except HistoryUnavailable:
+            return ""
+        for entry in entries:
+            if normalize(entry.title) == normalize(title):
+                return domain_from_url(entry.url)
+        return ""
+
+
+def _confidence_rank(value: str) -> int:
+    return {"low": 1, "medium": 2, "high": 3}.get(value, 0)
