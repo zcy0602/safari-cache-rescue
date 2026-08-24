@@ -45,4 +45,3 @@ class Candidate:
             "cache_version": self.cache_version,
             "match_reasons": list(self.match_reasons),
         }
-

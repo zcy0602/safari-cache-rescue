@@ -53,4 +53,3 @@ def resolve_window(
             raise ValueError("--from must not be later than --to")
         return start, end
     return None, None
-

@@ -49,4 +49,3 @@ def complete_html(title: str, body: str, encoding: str = "utf-8") -> bytes:
         title, body
     )
     return document.encode(encoding)
-
