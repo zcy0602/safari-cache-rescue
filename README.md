@@ -28,17 +28,17 @@ runs the command (Terminal, iTerm, or Codex), then quit and reopen that app:
 - macOS 14 or later
 - Python 3.9 or later
 
-From a local checkout:
+From a local checkout, run it without installing or configuring `PYTHONPATH`:
+
+```bash
+./safari-rescue doctor
+```
+
+To install the `safari-rescue` command instead:
 
 ```bash
 python3 -m pip install -e .
 safari-rescue doctor
-```
-
-You can also run it without installing:
-
-```bash
-PYTHONPATH=src python3 -m safari_cache_rescue doctor
 ```
 
 ## Usage
@@ -46,17 +46,22 @@ PYTHONPATH=src python3 -m safari_cache_rescue doctor
 Search by an exact URL or keywords:
 
 ```bash
-safari-rescue find "https://example.com/missing-page"
-safari-rescue find "workshop handbook" --since 2d
+./safari-rescue find "https://example.com/missing-page"
+./safari-rescue find "workshop handbook" --since 2d
 ```
 
 Search recent Safari history. With no time option, `recent` uses the last 12 hours:
 
 ```bash
-safari-rescue recent
-safari-rescue recent --since 30m
-safari-rescue recent --from 2026-08-23T09:00:00+08:00 --to 2026-08-23T18:00:00+08:00
+./safari-rescue recent
+./safari-rescue recent --since 30m
+./safari-rescue recent --from 2026-08-23T09:00:00+08:00 --to 2026-08-23T18:00:00+08:00
 ```
+
+Human-readable `recent` output reports the current number of cache blobs and
+the oldest and newest surviving blob modification times. This is an observation,
+not a retention guarantee: Safari may evict entries at any time. JSON output is
+unchanged and contains candidates only.
 
 Low-confidence HTML is hidden by default. Use `--all-candidates` to include it.
 Search commands also support `--limit 20` and `--json`.
@@ -64,7 +69,7 @@ Search commands also support `--limit 20` and `--json`.
 Export only after reviewing the candidate list:
 
 ```bash
-safari-rescue export 525191d5f7f8f87 --output recovered.html
+./safari-rescue export 525191d5f7f8f87 --output recovered.html
 ```
 
 The tool copies the cache bytes unchanged and writes
@@ -73,7 +78,7 @@ The tool copies the cache bytes unchanged and writes
 
 ## Confidence levels
 
-- **high**: complete HTML with an exact URL hit or exact Safari-history title match.
+- **high**: complete HTML with a canonical URL match or exact Safari-history title match.
 - **medium**: complete HTML with a title overlap or multiple query terms.
 - **low**: related HTML with only weak evidence or signs of truncation.
 

@@ -2,6 +2,7 @@ import argparse
 import json
 import platform
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Sequence
 
@@ -77,12 +78,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             arguments.end_value,
             default_since,
         )
+        cache_sources = None
         if arguments.command == "find":
             candidates = engine.find(arguments.query, start=start, end=end)
         else:
             assert start is not None and end is not None
-            candidates = engine.recent(start, end)
-        return _show_candidates(engine, candidates, arguments)
+            if arguments.json_output:
+                candidates = engine.recent(start, end)
+            else:
+                candidates, cache_sources = engine.recent_with_sources(start, end)
+        return _show_candidates(engine, candidates, arguments, cache_sources)
     except ValueError as error:
         print("error: {}".format(error), file=sys.stderr)
         return EXIT_USAGE
@@ -128,7 +133,12 @@ def _doctor() -> int:
     return EXIT_OK
 
 
-def _show_candidates(engine: RecoveryEngine, candidates: List[Candidate], arguments: argparse.Namespace) -> int:
+def _show_candidates(
+    engine: RecoveryEngine,
+    candidates: List[Candidate],
+    arguments: argparse.Namespace,
+    cache_sources=None,
+) -> int:
     for warning in engine.warnings:
         print("warning: {}".format(warning), file=sys.stderr)
     if not arguments.all_candidates:
@@ -136,7 +146,10 @@ def _show_candidates(engine: RecoveryEngine, candidates: List[Candidate], argume
     candidates = candidates[: arguments.limit]
     if arguments.json_output:
         print(json.dumps([candidate.public_dict() for candidate in candidates], ensure_ascii=False, indent=2))
-    elif candidates:
+    else:
+        if cache_sources is not None:
+            _show_cache_observation(cache_sources)
+    if not arguments.json_output and candidates:
         print("ID               CONF    VISITED                   DOMAIN                  TITLE")
         for candidate in candidates:
             visited = candidate.visit_time.isoformat(timespec="seconds") if candidate.visit_time else "-"
@@ -149,9 +162,41 @@ def _show_candidates(engine: RecoveryEngine, candidates: List[Candidate], argume
                     candidate.title[:80] or "(untitled)",
                 )
             )
-    else:
+    elif not arguments.json_output:
         print("No recoverable HTML candidates found.")
     return EXIT_OK if candidates else EXIT_NO_CANDIDATES
+
+
+def _show_cache_observation(sources) -> None:
+    modified_times = []
+    for source in sources:
+        try:
+            modified_times.append(source.path.stat().st_mtime)
+        except OSError:
+            continue
+
+    count = len(sources)
+    noun = "blob" if count == 1 else "blobs"
+    disclaimer = "This is not a retention guarantee; Safari may evict entries at any time."
+    if not modified_times:
+        print("Cache observation: {} {}; modification-time range unavailable. {}".format(count, noun, disclaimer))
+        return
+
+    now = datetime.now().timestamp()
+
+    def age(timestamp: float) -> str:
+        days = max(0, int((now - timestamp) // 86400))
+        return "<1d" if days == 0 else "{}d".format(days)
+
+    print(
+        "Cache observation: {} {}; oldest surviving blob modified {} ago, newest {} ago. {}".format(
+            count,
+            noun,
+            age(min(modified_times)),
+            age(max(modified_times)),
+            disclaimer,
+        )
+    )
 
 
 def _export(engine: RecoveryEngine, arguments: argparse.Namespace) -> int:

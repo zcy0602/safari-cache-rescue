@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -83,7 +84,34 @@ class CLITests(unittest.TestCase):
         create_blob(self.cache, "A1" * 20, complete_html("Recent Test", "cached"))
         result, output, error = self.run_cli(["recent"])
         self.assertEqual(result, EXIT_OK, error)
+        self.assertIn("Cache observation: 1 blob", output)
+        self.assertIn("not a retention guarantee", output)
         self.assertIn("Recent Test", output)
+
+    def test_recent_json_remains_an_array_without_observation_text(self) -> None:
+        now = datetime.now(timezone.utc).astimezone()
+        create_history(self.history, [("https://recent.test", "Recent JSON", now)])
+        create_blob(self.cache, "A2" * 20, complete_html("Recent JSON", "cached"))
+
+        result, output, error = self.run_cli(["recent", "--json"])
+
+        self.assertEqual(result, EXIT_OK, error)
+        self.assertIsInstance(json.loads(output), list)
+        self.assertNotIn("Cache observation", output)
+
+    def test_checkout_launcher_forwards_arguments_from_another_directory(self) -> None:
+        launcher = Path(__file__).resolve().parents[1] / "safari-rescue"
+
+        completed = subprocess.run(
+            [str(launcher), "--help"],
+            cwd=self.home,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, EXIT_OK, completed.stderr)
+        self.assertIn("Recover HTML from Safari's local cache", completed.stdout)
 
     def test_invalid_time_and_limit_return_usage_exit(self) -> None:
         result, _, error = self.run_cli(["recent", "--since", "forever"])

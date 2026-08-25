@@ -103,6 +103,52 @@ class RecoveryEngineTests(unittest.TestCase):
         self.assertEqual([candidate.title for candidate in candidates], ["Recent Synthetic Page"])
         self.assertEqual(candidates[0].confidence, "high")
 
+    def test_recent_does_not_treat_an_outbound_url_as_page_identity(self) -> None:
+        create_history(self.history_path, [("https://github.com/", "GitHub", self.now)])
+        create_blob(
+            self.cache_root,
+            "04" * 20,
+            complete_html("Unrelated Synthetic Page", '<a href="https://github.com/">GitHub</a>'),
+        )
+
+        candidates = self.engine().recent(self.now - timedelta(hours=1), self.now)
+
+        self.assertEqual(candidates, [])
+
+    def test_recent_matches_history_url_to_canonical_url(self) -> None:
+        url = "https://canonical.example.test/page"
+        data = (
+            '<!doctype html><html><head><title>Canonical Synthetic</title>'
+            '<link rel="canonical" href="{}"></head><body>cached</body></html>'.format(url)
+        ).encode()
+        create_history(self.history_path, [(url, "Different History Title", self.now)])
+        create_blob(self.cache_root, "05" * 20, data)
+
+        candidates = self.engine().recent(self.now - timedelta(hours=1), self.now)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].confidence, "high")
+        self.assertEqual(candidates[0].domain, "canonical.example.test")
+
+    def test_url_find_uses_canonical_and_ignores_same_url_as_an_outbound_link(self) -> None:
+        url = "https://target.example.test/page"
+        canonical = (
+            '<!doctype html><html><head><title>Canonical Target</title>'
+            '<link rel="canonical" href="{}"></head><body>cached</body></html>'.format(url)
+        ).encode()
+        create_blob(self.cache_root, "06" * 20, canonical)
+        create_blob(
+            self.cache_root,
+            "07" * 20,
+            complete_html("Unrelated Link Page", '<a href="{}">source</a>'.format(url)),
+        )
+
+        candidates = self.engine().find(url)
+
+        self.assertEqual([candidate.title for candidate in candidates], ["Canonical Target"])
+        self.assertEqual(candidates[0].confidence, "high")
+        self.assertEqual(candidates[0].domain, "target.example.test")
+
     def test_recent_requires_history(self) -> None:
         create_blob(self.cache_root, "F" * 40, complete_html("Synthetic", "cached"))
         with self.assertRaises(HistoryUnavailable):

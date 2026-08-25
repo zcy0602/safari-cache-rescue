@@ -109,11 +109,28 @@ def domain_from_url(value: str) -> str:
         return ""
 
 
-def domain_from_html(text: str) -> str:
+def normalize_url_identity(value: str) -> str:
+    try:
+        parsed = urlparse(html.unescape(value.strip()))
+    except ValueError:
+        return ""
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return parsed._replace(
+        scheme=parsed.scheme.casefold(),
+        netloc=parsed.netloc.casefold(),
+        path=parsed.path or "/",
+        fragment="",
+    ).geturl()
+
+
+def canonical_url_from_html(text: str) -> str:
     canonical = _CANONICAL.search(text)
-    if canonical:
-        return domain_from_url(html.unescape(canonical.group(1)))
-    return ""
+    return html.unescape(canonical.group(1)).strip() if canonical else ""
+
+
+def domain_from_html(text: str) -> str:
+    return domain_from_url(canonical_url_from_html(text))
 
 
 def read_stable(path: Path) -> Optional[bytes]:
@@ -215,8 +232,26 @@ class RecoveryEngine:
         )
 
     def recent(self, start: datetime, end: datetime) -> List[Candidate]:
+        candidates, _ = self.recent_with_sources(start, end)
+        return candidates
+
+    def recent_with_sources(
+        self,
+        start: datetime,
+        end: datetime,
+    ) -> Tuple[List[Candidate], List[BlobSource]]:
         entries = self._history_entries(None, start, end, required=True)
-        return self._scan(None, entries, recent_mode=True, require_history_match=True)
+        sources = self.blob_sources()
+        return (
+            self._scan(
+                None,
+                entries,
+                recent_mode=True,
+                require_history_match=True,
+                sources=sources,
+            ),
+            sources,
+        )
 
     def _scan(
         self,
@@ -224,14 +259,20 @@ class RecoveryEngine:
         entries: Sequence[HistoryEntry],
         recent_mode: bool,
         require_history_match: bool,
+        sources: Optional[Sequence[BlobSource]] = None,
     ) -> List[Candidate]:
         candidates: Dict[str, Candidate] = {}
         query_normalized = normalize(query or "")
         query_domain = domain_from_url(query or "")
         is_url_query = bool(query_domain)
+        query_url = normalize_url_identity(query or "") if is_url_query else ""
         query_tokens = [] if is_url_query else meaningful_tokens(query or "")
+        entries_with_urls = [
+            (entry, normalize_url_identity(entry.url))
+            for entry in entries
+        ]
 
-        for source in self.blob_sources():
+        for source in sources if sources is not None else self.blob_sources():
             data = read_stable(source.path)
             if data is None:
                 continue
@@ -240,6 +281,8 @@ class RecoveryEngine:
                 continue
             title = extract_title(text)
             lowered = text.casefold()
+            canonical_url = canonical_url_from_html(text)
+            canonical_identity = normalize_url_identity(canonical_url)
             normalized_title = normalize(title)
             complete = is_complete_html(text)
             reasons: List[str] = []
@@ -248,11 +291,14 @@ class RecoveryEngine:
             exact_url = False
             exact_title = False
             title_overlap = False
-            for entry in entries:
-                if entry.url and entry.url.casefold() in lowered:
+            if query_url and query_url == canonical_identity:
+                exact_url = True
+                reasons.append("canonical URL matches query")
+            for entry, entry_url in entries_with_urls:
+                if canonical_identity and entry_url == canonical_identity:
                     exact_url = True
                     matched_entries.append(entry)
-                    reasons.append("exact URL present in HTML")
+                    reasons.append("canonical URL matches Safari history")
                 if title and entry.title and normalized_title == normalize(entry.title):
                     exact_title = True
                     matched_entries.append(entry)
@@ -275,7 +321,9 @@ class RecoveryEngine:
             literal_in_title = bool(
                 query_normalized and not is_url_query and query_normalized in normalized_title
             )
-            literal_in_body = bool(query_normalized and query_normalized in lowered)
+            literal_in_body = bool(
+                query_normalized and not is_url_query and query_normalized in lowered
+            )
             token_hits = sum(1 for token in query_tokens if token in lowered)
             if literal_in_title:
                 reasons.append("query appears in HTML title")
@@ -302,7 +350,9 @@ class RecoveryEngine:
 
             matched_entry = max(matched_entries, key=lambda item: item.visit_time) if matched_entries else None
             domain = (
-                domain_from_url(matched_entry.url) if matched_entry else query_domain or domain_from_html(text)
+                query_domain
+                or (domain_from_url(matched_entry.url) if matched_entry else "")
+                or domain_from_url(canonical_url)
             )
             digest = hashlib.sha256(data).hexdigest()
             candidate = Candidate(
