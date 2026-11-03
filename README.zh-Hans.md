@@ -77,7 +77,7 @@ Safari 缓存属于带版本号的内部实现细节。本工具会自动发现 
 测试套件只使用合成的 History 数据库和缓存 Blob：
 
 ```bash
-python3 -m unittest discover -s tests -v
+PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 请勿把真实浏览历史、缓存数据、Cookie 或恢复出的受版权保护页面添加到测试 Fixture 或问题报告中。

@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Tuple
@@ -14,7 +15,7 @@ def safari_paths(home: Path) -> Tuple[Path, Path]:
 
 def create_history(path: Path, entries: Iterable[Tuple[str, str, datetime]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.executescript(
             """
             CREATE TABLE history_items (

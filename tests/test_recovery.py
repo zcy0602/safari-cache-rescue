@@ -225,6 +225,48 @@ class RecoveryEngineTests(unittest.TestCase):
         self.assertEqual(candidates[0].title, "UTF16 Synthetic Page")
         self.assertIsNotNone(decode_html(utf16))
 
+    def test_canonical_link_with_href_before_rel_is_recognized(self) -> None:
+        url = "https://order.example.test/page"
+        data = (
+            '<!doctype html><html><head><title>Attribute Order Synthetic</title>'
+            "<link href='{}' data-x=1 rel=\"alternate canonical\"></head>"
+            "<body>cached</body></html>".format(url)
+        ).encode()
+        create_blob(self.cache_root, "08" * 20, data)
+
+        candidates = self.engine().find(url)
+
+        self.assertEqual([candidate.title for candidate in candidates], ["Attribute Order Synthetic"])
+        self.assertEqual(candidates[0].confidence, "high")
+
+    def test_legacy_charset_declared_in_meta_is_decoded(self) -> None:
+        for label, encoding, title in (
+            ("gb2312", "gb18030", "合成恢复手册"),
+            ("Shift_JIS", "cp932", "合成の復旧ハンドブック"),
+        ):
+            with self.subTest(label=label):
+                data = (
+                    '<!doctype html><html><head><meta http-equiv="Content-Type" '
+                    'content="text/html; charset={}"><title>{}</title></head>'
+                    "<body>cached</body></html>".format(label, title)
+                ).encode(encoding)
+                self.assertIsNone(_try_utf8(data))
+                create_blob(self.cache_root, hashlib.sha1(data).hexdigest(), data)
+
+                candidates = self.engine().find(title)
+
+                self.assertEqual([candidate.title for candidate in candidates], [title])
+                self.assertEqual(candidates[0].confidence, "medium")
+
+    def test_stray_invalid_byte_does_not_hide_utf8_page(self) -> None:
+        data = complete_html("Stray Byte Synthetic", "broken MARK byte").replace(b"MARK", b"\xff")
+        self.assertIsNone(_try_utf8(data))
+        create_blob(self.cache_root, "0A" * 20, data)
+
+        candidates = self.engine().find("Stray Byte Synthetic")
+
+        self.assertEqual([candidate.title for candidate in candidates], ["Stray Byte Synthetic"])
+
     def test_duplicate_identical_blobs_are_coalesced(self) -> None:
         data = complete_html("Duplicate Synthetic", "duplicate recovery text")
         create_blob(self.cache_root, "3" * 40, data)
@@ -296,6 +338,13 @@ class RecoveryEngineTests(unittest.TestCase):
                 return BytesIO(data)
 
         self.assertIsNone(read_stable(ChangingPath()))
+
+
+def _try_utf8(data: bytes):
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@ There is no linter or formatter configured. Tests run fine on Linux; they never 
 All code is in `src/safari_cache_rescue/`. Flow: `cli.py` → `RecoveryEngine` (`recovery.py`) → `HistoryReader` (`history.py`) + cache blob scan.
 
 - **Two data sources.** `History.db` (SQLite, opened `mode=ro` + `PRAGMA query_only`; timestamps are seconds since the Apple epoch 2001-01-01 UTC) and WebKitCache blobs discovered via `Version */Blobs` under two roots (`~/Library/Caches/...` and the sandboxed `~/Library/Containers/com.apple.Safari/...`). Cache version is discovered, never hard-coded.
-- **Matching (`RecoveryEngine._scan`).** Every blob is read with `read_stable` (skips files that change during read, >64 MiB, or non-HTML prefixes), decoded (`utf-16`/`utf-8-sig`/`utf-8`), then scored against the query and history entries:
+- **Matching (`RecoveryEngine._scan`).** Every blob is read with `read_stable` (skips files that change during read, >64 MiB, or non-HTML prefixes), decoded by `decode_html` (BOM → strict UTF-8 → `<meta charset>` mapped through WHATWG-style aliases such as gb2312→gb18030 → lenient `errors="replace"` fallback; decoded text is only for matching, export copies raw bytes), then scored against the query and history entries:
   - URL identity comes **only** from `<link rel="canonical">` (normalized via `normalize_url_identity`). A URL merely appearing as a link in the body is deliberately *not* a match — regressions here are covered by tests.
   - URL queries skip keyword/token matching entirely.
   - `recent` (and `find` with a time window) require a history match (canonical URL, exact title, or title overlap); plain `find` also accepts body/keyword hits.

@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -40,7 +41,7 @@ class HistoryReader:
 
     def probe(self) -> None:
         try:
-            with self._connect() as connection:
+            with closing(self._connect()) as connection:
                 connection.execute("SELECT 1 FROM history_items LIMIT 1").fetchone()
         except (OSError, sqlite3.Error, HistoryUnavailable) as error:
             if isinstance(error, HistoryUnavailable):
@@ -79,8 +80,8 @@ class HistoryReader:
         sql += " ORDER BY history_visits.visit_time DESC"
 
         try:
-            with self._connect() as connection:
-                rows = connection.execute(sql, parameters).fetchall()
+            with closing(self._connect()) as connection:
+                rows =connection.execute(sql, parameters).fetchall()
         except (OSError, sqlite3.Error, HistoryUnavailable) as error:
             if isinstance(error, HistoryUnavailable):
                 raise

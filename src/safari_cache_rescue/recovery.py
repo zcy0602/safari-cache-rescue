@@ -1,3 +1,4 @@
+import codecs
 import hashlib
 import html
 import json
@@ -15,9 +16,26 @@ from .models import BlobSource, Candidate, HistoryEntry
 MAX_HTML_BYTES = 64 * 1024 * 1024
 _TITLE = re.compile(r"(?is)<title[^>]*>(.*?)</title>")
 _TAG = re.compile(r"(?s)<[^>]+>")
-_CANONICAL = re.compile(
-    r"(?is)<link[^>]+rel=[\"']?canonical[\"']?[^>]+href=[\"']([^\"']+)[\"']"
-)
+_LINK_TAG = re.compile(r"(?is)<link\b[^>]*>")
+_ATTRIBUTE = re.compile(r"""(?s)([^\s"'<>/=]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))""")
+_META_CHARSET = re.compile(r"""(?i)<meta\b[^>]*?charset\s*=\s*["']?\s*([a-z0-9._:-]+)""")
+_HTML_MARKERS = ("<!doctype html", "<html", "<head", "<title")
+# Labels that browsers (per the WHATWG Encoding spec) decode with a superset codec.
+_CHARSET_ALIASES = {
+    "gb2312": "gb18030",
+    "gbk": "gb18030",
+    "x-gbk": "gb18030",
+    "big5": "big5hkscs",
+    "shift_jis": "cp932",
+    "shift-jis": "cp932",
+    "sjis": "cp932",
+    "x-sjis": "cp932",
+    "euc-kr": "cp949",
+    "iso-8859-1": "cp1252",
+    "latin1": "cp1252",
+    "us-ascii": "cp1252",
+    "ascii": "cp1252",
+}
 _WORD = re.compile(r"\w+", re.UNICODE)
 
 
@@ -62,23 +80,50 @@ def meaningful_tokens(value: str) -> List[str]:
     return list(dict.fromkeys(token.casefold() for token in _WORD.findall(value) if len(token) >= 2))
 
 
+def _has_html_marker(text: str) -> bool:
+    lowered = text[:65536].casefold()
+    return any(marker in lowered for marker in _HTML_MARKERS)
+
+
+def declared_charset(data: bytes) -> Optional[str]:
+    """Return the Python codec for a ``<meta charset>`` declaration, if any."""
+    match = _META_CHARSET.search(data[:65536].decode("latin-1"))
+    if not match:
+        return None
+    label = match.group(1).casefold()
+    if label.startswith("utf-16"):
+        # A meta tag readable as ASCII cannot really be UTF-16; browsers use UTF-8.
+        label = "utf-8"
+    label = _CHARSET_ALIASES.get(label, label)
+    try:
+        return codecs.lookup(label).name
+    except LookupError:
+        return None
+
+
 def decode_html(data: bytes) -> Optional[str]:
     prefix = data[:65536]
-    encodings = []
     if prefix.startswith((b"\xff\xfe", b"\xfe\xff")):
-        encodings.append("utf-16")
+        encodings = ["utf-16"]
     elif prefix.startswith(b"\xef\xbb\xbf"):
-        encodings.append("utf-8-sig")
-    encodings.append("utf-8")
+        encodings = ["utf-8-sig"]
+    else:
+        # Strict UTF-8 first: non-ASCII text in legacy encodings is almost never valid UTF-8.
+        encodings = ["utf-8"]
+        declared = declared_charset(prefix)
+        if declared and declared != "utf-8":
+            encodings.append(declared)
     for encoding in encodings:
         try:
             text = data.decode(encoding)
         except UnicodeDecodeError:
             continue
-        lowered = text[:65536].casefold()
-        if any(marker in lowered for marker in ("<!doctype html", "<html", "<head", "<title")):
+        if _has_html_marker(text):
             return text
-    return None
+    # Last resort: a stray invalid byte should not hide an otherwise readable page.
+    # Export always copies the original bytes, so this only affects matching.
+    text = data.decode(encodings[-1], errors="replace")
+    return text if _has_html_marker(text) else None
 
 
 def looks_like_html(data: bytes) -> bool:
@@ -86,8 +131,7 @@ def looks_like_html(data: bytes) -> bool:
         prefix = data.decode("utf-16", errors="ignore")
     else:
         prefix = data.decode("utf-8-sig", errors="ignore")
-    lowered = prefix.casefold()
-    return any(marker in lowered for marker in ("<!doctype html", "<html", "<head", "<title"))
+    return _has_html_marker(prefix)
 
 
 def extract_title(text: str) -> str:
@@ -125,8 +169,16 @@ def normalize_url_identity(value: str) -> str:
 
 
 def canonical_url_from_html(text: str) -> str:
-    canonical = _CANONICAL.search(text)
-    return html.unescape(canonical.group(1)).strip() if canonical else ""
+    for tag in _LINK_TAG.finditer(text):
+        attributes: Dict[str, str] = {}
+        for attribute in _ATTRIBUTE.finditer(tag.group(0)):
+            value = next(group for group in attribute.group(2, 3, 4) if group is not None)
+            attributes.setdefault(attribute.group(1).casefold(), value)
+        if "canonical" in attributes.get("rel", "").casefold().split():
+            href = html.unescape(attributes.get("href", "")).strip()
+            if href:
+                return href
+    return ""
 
 
 def domain_from_html(text: str) -> str:
@@ -267,8 +319,14 @@ class RecoveryEngine:
         is_url_query = bool(query_domain)
         query_url = normalize_url_identity(query or "") if is_url_query else ""
         query_tokens = [] if is_url_query else meaningful_tokens(query or "")
-        entries_with_urls = [
-            (entry, normalize_url_identity(entry.url))
+        # Per-entry work is hoisted out of the blob loop: it runs once instead of once per blob.
+        prepared_entries = [
+            (
+                entry,
+                normalize_url_identity(entry.url),
+                normalize(entry.title),
+                set(meaningful_tokens(entry.title)),
+            )
             for entry in entries
         ]
 
@@ -280,10 +338,11 @@ class RecoveryEngine:
             if text is None:
                 continue
             title = extract_title(text)
-            lowered = text.casefold()
+            lowered = text.casefold() if query_normalized and not is_url_query else ""
             canonical_url = canonical_url_from_html(text)
             canonical_identity = normalize_url_identity(canonical_url)
             normalized_title = normalize(title)
+            title_tokens = set(meaningful_tokens(title))
             complete = is_complete_html(text)
             reasons: List[str] = []
             matched_entries: List[HistoryEntry] = []
@@ -294,19 +353,16 @@ class RecoveryEngine:
             if query_url and query_url == canonical_identity:
                 exact_url = True
                 reasons.append("canonical URL matches query")
-            for entry, entry_url in entries_with_urls:
+            for entry, entry_url, history_title, history_tokens in prepared_entries:
                 if canonical_identity and entry_url == canonical_identity:
                     exact_url = True
                     matched_entries.append(entry)
                     reasons.append("canonical URL matches Safari history")
-                if title and entry.title and normalized_title == normalize(entry.title):
+                if title and entry.title and normalized_title == history_title:
                     exact_title = True
                     matched_entries.append(entry)
                     reasons.append("HTML title matches Safari history")
                 elif title and entry.title:
-                    history_title = normalize(entry.title)
-                    title_tokens = set(meaningful_tokens(title))
-                    history_tokens = set(meaningful_tokens(entry.title))
                     overlap = title_tokens & history_tokens
                     overlap_ratio = len(overlap) / max(len(title_tokens), len(history_tokens), 1)
                     if (

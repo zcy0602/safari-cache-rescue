@@ -91,7 +91,7 @@ future Safari releases may still require updates.
 The test suite uses synthetic History databases and cache blobs only:
 
 ```bash
-python3 -m unittest discover -s tests -v
+PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 Do not add real browser history, cache data, cookies, or recovered copyrighted
