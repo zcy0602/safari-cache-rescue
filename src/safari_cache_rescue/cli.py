@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import platform
 import sys
 from datetime import datetime
@@ -15,6 +16,7 @@ from .recovery import (
     RecoveryEngine,
     default_cache_roots,
 )
+from .terminal import safe_text
 from .timeparse import resolve_window
 
 
@@ -33,7 +35,11 @@ class Parser(argparse.ArgumentParser):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = Parser(prog="safari-rescue", description="Recover HTML from Safari's local cache")
+    parser = Parser(
+        prog="safari-rescue",
+        description="Recover HTML from Safari's local cache",
+        epilog="Run without a command in a terminal for interactive mode.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("doctor", help="check Safari data access without changing anything")
 
@@ -61,7 +67,16 @@ def _add_search_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--all-candidates", action="store_true")
 
 
+def _interactive_terminal() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv and _interactive_terminal():
+        from .interactive import run_interactive
+
+        return run_interactive()
     try:
         arguments = build_parser().parse_args(argv)
         if arguments.command == "doctor":
@@ -158,8 +173,8 @@ def _show_candidates(
                     candidate.candidate_id[:16],
                     candidate.confidence,
                     visited[:25],
-                    candidate.domain[:23] or "-",
-                    candidate.title[:80] or "(untitled)",
+                    safe_text(candidate.domain)[:23] or "-",
+                    safe_text(candidate.title)[:80] or "(untitled)",
                 )
             )
     elif not arguments.json_output:

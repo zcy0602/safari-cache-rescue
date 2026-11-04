@@ -18,6 +18,7 @@ PYTHONPATH=src:tests python3 -m unittest test_recovery.RecoveryEngineTests.test_
 
 # Run the CLI from a checkout (the launcher sets PYTHONPATH itself)
 ./safari-rescue doctor | find <url-or-keywords> | recent | export <id-prefix> --output out.html
+./safari-rescue            # no arguments in a TTY: interactive mode
 ```
 
 There is no linter or formatter configured. Tests run fine on Linux; they never touch real Safari data. CI (`.github/workflows/test.yml`) runs the suite on Ubuntu and macOS with Python 3.9 and 3.13, treating `ResourceWarning` as an error.
@@ -37,10 +38,12 @@ All code is in `src/safari_cache_rescue/`. Flow: `cli.py` → `RecoveryEngine` (
 - **History is optional for `find`, required for `recent`.** `find` falls back to cache-only matching and appends to `engine.warnings` (printed to stderr by the CLI); `recent` raises `HistoryUnavailable`.
 - **Candidate IDs are the full content SHA-256.** `export` re-scans the cache, accepts a hex prefix ≥12 chars, rejects ambiguous prefixes, writes via temp file + SHA-256 verification + `os.replace`, and writes a `<output>.recovery.json` sidecar. Refuses to overwrite either file without `--force`.
 - **CLI contract (`cli.py`).** Errors are exceptions mapped to exit codes in `main()`: 0 ok, 1 no candidates, 2 usage (`ValueError`; the custom `Parser.error` raises instead of exiting), 3 source unavailable, 4 candidate unavailable, 5 export failed. `--json` output for `find`/`recent` is a plain array of `Candidate.public_dict()` with a fixed key set (asserted in tests); human `recent` output additionally prints a cache-observation line, JSON does not.
+- **Interactive mode (`interactive.py`, `terminal.py`, `i18n.py`).** `cli.main` runs it only when there are no arguments and stdin/stdout are TTYs; otherwise no arguments is still a usage error. Rendering is inline: `Live` redraws one region by moving the cursor up and clearing, and `commit()` makes lines permanent — every line must fit the terminal width (use `fit`/`pad`, which are CJK-width aware) or the redraw arithmetic breaks. Keys come from `Terminal.read_key()` (cbreak mode, escape-sequence parsing); tests drive `InteractiveApp` with a `FakeTerminal` that scripts keys and raises `KeyboardInterrupt` when they run out. Interactive strings live in `i18n.py` (`EN`/`ZH`, every key in both — a test enforces it; language from `SAFARI_RESCUE_LANG`/`LC_ALL`/`LC_MESSAGES`/`LANG`). Subcommand output stays English.
 - **Time windows (`timeparse.py`).** `--since` (`Nm`/`Nh`/`Nd`) is mutually exclusive with `--from`/`--to`; `--to` requires `--from`; naive ISO times get the local timezone. `recent` defaults to `12h`.
 
 ## Invariants to preserve
 
 - Never write to Safari data, make network requests, open exported HTML, or read anything beyond `History.db` and WebKitCache (no cookies, passwords, AutoFill, SafariTabs, private browsing).
 - Public output and recovery reports must not contain local filesystem paths of cache blobs (tests assert the home dir is absent).
+- Titles, domains, and page text are untrusted: pass them through `terminal.safe_text` before printing to a terminal (strips control characters such as ESC and bidi overrides).
 - Tests use only synthetic fixtures built by `tests/helpers.py` (`create_history`, `create_blob`, `complete_html`) in a temp `HOME`; CLI tests patch `HOME`/`Path.home`. Never add real history, cache data, or recovered pages to fixtures.

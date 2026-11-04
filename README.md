@@ -43,6 +43,26 @@ safari-rescue doctor
 
 ## Usage
 
+### Interactive mode
+
+Run the command without arguments in a terminal:
+
+```bash
+./safari-rescue
+```
+
+It checks access, then lets you browse recent pages or search, using the arrow
+keys. In a result list, `←`/`→` change the time window (1 hour to 7 days),
+`tab` shows low-confidence matches, typing filters by title or domain, and
+`⏎` opens a candidate to preview its text or export it (by default to
+`~/Downloads`, named after the page title). `esc` goes back, `ctrl-c` quits.
+
+The interface follows `LANG` (Chinese or English); set `SAFARI_RESCUE_LANG=en`
+or `zh` to override it, and `NO_COLOR=1` to disable colors. The subcommands
+below are unchanged, always print English, and are what scripts should use.
+
+### Commands
+
 Search by an exact URL or keywords:
 
 ```bash

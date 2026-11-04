@@ -143,6 +143,24 @@ def extract_title(text: str) -> str:
     return " ".join(html.unescape(_TAG.sub("", match.group(1))).split())
 
 
+_INVISIBLE = re.compile(r"(?is)<!--.*?-->|<(script|style|noscript|template|svg|head)\b.*?</\1\s*>")
+_BLOCK_BOUNDARY = re.compile(
+    r"(?i)<(?:br|/?(?:p|div|li|ul|ol|tr|table|h[1-6]|section|article|header|footer|blockquote|pre))\b[^>]*>"
+)
+
+
+def html_to_text(text: str) -> List[str]:
+    """Return the readable paragraphs of an HTML document, for previews only."""
+    visible = _BLOCK_BOUNDARY.sub("\n", _INVISIBLE.sub(" ", text))
+    plain = html.unescape(_TAG.sub(" ", visible))
+    paragraphs = []
+    for block in plain.split("\n"):
+        paragraph = " ".join(block.split())
+        if paragraph:
+            paragraphs.append(paragraph)
+    return paragraphs
+
+
 def is_complete_html(text: str) -> bool:
     lowered = text.casefold()
     return "</html>" in lowered and ("</body>" in lowered or "<body" not in lowered)
