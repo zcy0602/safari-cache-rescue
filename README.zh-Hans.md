@@ -66,11 +66,11 @@ safari-rescue doctor
 
 ## 置信度等级
 
-- **high（高）**：HTML 完整，并且 canonical URL 匹配，或 HTML 标题与 Safari 历史记录标题完全一致。
+- **high（高）**：HTML 完整，并且缓存记录中的 URL 或 canonical URL 匹配，或 HTML 标题与 Safari 历史记录标题完全一致。
 - **medium（中）**：HTML 完整，并且标题有显著重合，或命中多个查询词。
 - **low（低）**：HTML 与查询相关，但只有较弱证据或存在截断迹象。
 
-Safari 缓存属于带版本号的内部实现细节。本工具会自动发现 `Version */Blobs` 目录，而不是硬编码某个版本；但未来的 Safari 版本仍可能需要工具进行适配。
+Safari 缓存属于带版本号的内部实现细节。本工具会自动发现 `Version *` 目录，而不是硬编码某个版本：从 `Blobs` 读取较大的响应内容，并尽力解析 `Records`，以获得每个缓存页面的请求 URL，并找回 WebKit 直接存放在记录文件里的小页面。未来的 Safari 版本仍可能需要工具进行适配；无法解析的记录会被跳过。
 
 ## 开发
 

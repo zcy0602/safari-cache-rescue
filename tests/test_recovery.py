@@ -1,11 +1,13 @@
 import hashlib
 import json
+import struct
 import tempfile
 import unittest
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from safari_cache_rescue.cache_records import record_url
 from safari_cache_rescue.history import HistoryUnavailable
 from safari_cache_rescue.recovery import (
     CacheUnavailable,
@@ -16,7 +18,7 @@ from safari_cache_rescue.recovery import (
     read_stable,
 )
 
-from helpers import complete_html, create_blob, create_history, safari_paths
+from helpers import complete_html, create_blob, create_history, create_record, safari_paths
 
 
 class RecoveryEngineTests(unittest.TestCase):
@@ -266,6 +268,75 @@ class RecoveryEngineTests(unittest.TestCase):
         candidates = self.engine().find("Stray Byte Synthetic")
 
         self.assertEqual([candidate.title for candidate in candidates], ["Stray Byte Synthetic"])
+
+    def test_inline_record_body_is_found_by_record_url_and_exported_exactly(self) -> None:
+        url = "https://inline.example.test/small-page"
+        body = b"\n  " + complete_html("Inline Synthetic", "small cached page")
+        create_history(self.history_path, [(url, "Different History Title", self.now)])
+        create_record(self.cache_root, url, body=body)
+
+        candidates = self.engine().recent(self.now - timedelta(hours=1), self.now)
+
+        self.assertEqual([candidate.title for candidate in candidates], ["Inline Synthetic"])
+        self.assertEqual(candidates[0].confidence, "high")
+        self.assertEqual(candidates[0].domain, "inline.example.test")
+        self.assertIn("cache record URL matches Safari history", candidates[0].match_reasons)
+        self.assertEqual(candidates[0].sha256, hashlib.sha256(body).hexdigest())
+
+        output = self.home / "inline.html"
+        exported, report_path = self.engine().export(candidates[0].candidate_id, output)
+        self.assertEqual(exported.read_bytes(), body)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["domain"], "inline.example.test")
+        self.assertNotIn(str(self.home), report_path.read_text(encoding="utf-8"))
+
+    def test_record_links_url_to_blob_by_body_hash(self) -> None:
+        url = "https://blob.example.test/large-page"
+        name = "0B" * 20
+        create_blob(self.cache_root, name, complete_html("Blob Without Canonical", "large page"))
+        create_blob(
+            self.cache_root,
+            "0C" * 20,
+            complete_html("Unrelated Link Page", '<a href="{}">source</a>'.format(url)),
+        )
+        create_record(self.cache_root, url, blob_name=name)
+
+        candidates = self.engine().find(url)
+
+        self.assertEqual([candidate.title for candidate in candidates], ["Blob Without Canonical"])
+        self.assertEqual(candidates[0].confidence, "high")
+        self.assertEqual(candidates[0].domain, "blob.example.test")
+        self.assertIn("cache record URL matches query", candidates[0].match_reasons)
+
+    def test_record_links_url_to_blob_through_hard_link(self) -> None:
+        url = "https://link.example.test/page"
+        name = "not-a-content-hash"
+        create_blob(self.cache_root, name, complete_html("Hard Linked Synthetic", "cached"))
+        create_record(self.cache_root, url, blob_name=name, hard_link=True)
+
+        candidates = self.engine().find(url)
+
+        self.assertEqual([candidate.title for candidate in candidates], ["Hard Linked Synthetic"])
+        self.assertEqual(candidates[0].confidence, "high")
+
+    def test_unusable_records_are_skipped(self) -> None:
+        create_record(self.cache_root, "https://script.example.test/app.js", body=b"var page = 1;")
+        record_dir = self.cache_root / "Version 17" / "Records" / "partition" / "Resource"
+        record_dir.mkdir(parents=True)
+        (record_dir / "garbage").write_bytes(b"\x00\x01\x02 not a record")
+        create_blob(self.cache_root, "0D" * 20, complete_html("Plain Blob Synthetic", "cached"))
+
+        candidates = self.engine().find("Plain Blob Synthetic")
+
+        self.assertEqual([candidate.title for candidate in candidates], ["Plain Blob Synthetic"])
+        self.assertEqual(len(self.engine().blob_sources()), 1)
+
+    def test_record_url_parses_utf16_and_unanchored_identifiers(self) -> None:
+        url = "https://utf16.example.test/页面"
+        encoded = struct.pack("<IB", len(url), 0) + url.encode("utf-16-le")
+        self.assertEqual(record_url(b"\x11\x00\x00\x00" + encoded + b"\xff" * 8)[0], url)
+        self.assertEqual(record_url(b"\x00\x00https://bare.example.test/x\xff\x00")[0], "https://bare.example.test/x")
+        self.assertEqual(record_url(b"no url here"), ("", 0))
 
     def test_duplicate_identical_blobs_are_coalesced(self) -> None:
         data = complete_html("Duplicate Synthetic", "duplicate recovery text")

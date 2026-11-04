@@ -1,8 +1,11 @@
+import hashlib
+import os
 import sqlite3
+import struct
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Tuple
+from typing import Iterable, Optional, Tuple
 
 from safari_cache_rescue.history import datetime_to_apple_seconds
 
@@ -50,3 +53,55 @@ def complete_html(title: str, body: str, encoding: str = "utf-8") -> bytes:
         title, body
     )
     return document.encode(encoding)
+
+
+def _encode_string(value: str) -> bytes:
+    raw = value.encode("latin-1")
+    return struct.pack("<IB", len(raw), 1) + raw
+
+
+def create_record(
+    cache_root: Path,
+    url: str,
+    body: Optional[bytes] = None,
+    blob_name: Optional[str] = None,
+    hard_link: bool = False,
+    version: str = "Version 17",
+    partition: str = "example.test",
+) -> Path:
+    """Write a synthetic NetworkCache record laid out like WebKit's ``Storage::encodeRecord``.
+
+    With ``body`` the body is stored inline at the end of the record. With
+    ``blob_name`` the record references ``Blobs/<blob_name>`` by hash and,
+    if ``hard_link`` is set, through a ``<record>-blob`` hard link.
+    """
+    key_hash = hashlib.sha1(url.encode()).digest()
+    try:
+        body_hash = bytes.fromhex(blob_name or "")
+    except ValueError:
+        body_hash = b""
+    body_hash = body_hash or hashlib.sha1(body or b"").digest()
+    header = b"\x00" * 7 + b"text/html" + b"\x00" * 9
+    metadata = (
+        struct.pack("<I", 17)
+        + _encode_string(partition)
+        + _encode_string("Resource")
+        + _encode_string(url)
+        + struct.pack("<I", 0xFFFFFFFF)  # null range string
+        + key_hash
+        + hashlib.sha1(partition.encode()).digest()
+        + struct.pack("<q", 1_000_000)
+        + hashlib.sha1(header).digest()
+        + struct.pack("<Q", len(header))
+        + body_hash
+        + struct.pack("<Q", len(body) if body is not None else 4096)
+        + struct.pack("<B", 1 if body is not None else 0)
+    )
+    checksum = hashlib.sha1(metadata).digest()
+    record_dir = cache_root / version / "Records" / hashlib.sha1(partition.encode()).hexdigest() / "Resource"
+    record_dir.mkdir(parents=True, exist_ok=True)
+    record = record_dir / key_hash.hex()
+    record.write_bytes(metadata + checksum + header + (body or b""))
+    if blob_name and hard_link:
+        os.link(cache_root / version / "Blobs" / blob_name, str(record) + "-blob")
+    return record

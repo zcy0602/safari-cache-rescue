@@ -13,8 +13,14 @@ class HistoryEntry:
 
 @dataclass(frozen=True)
 class BlobSource:
+    """Cached response body: a whole ``Blobs`` file, or the tail of a record file."""
+
     path: Path
     cache_version: str
+    # Request URL from the matching cache record, when one was found.
+    url: str = ""
+    # Body start inside ``path``; non-zero only for bodies stored inline in a record.
+    offset: int = 0
 
 
 @dataclass

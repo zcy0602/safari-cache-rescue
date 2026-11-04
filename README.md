@@ -78,13 +78,16 @@ The tool copies the cache bytes unchanged and writes
 
 ## Confidence levels
 
-- **high**: complete HTML with a canonical URL match or exact Safari-history title match.
+- **high**: complete HTML whose cache-record URL or canonical URL matches, or whose title exactly matches a Safari-history title.
 - **medium**: complete HTML with a title overlap or multiple query terms.
 - **low**: related HTML with only weak evidence or signs of truncation.
 
 Safari's cache is an internal, versioned implementation detail. This tool
-discovers `Version */Blobs` directories instead of hard-coding one version, but
-future Safari releases may still require updates.
+discovers `Version *` directories instead of hard-coding one version. It reads
+large bodies from `Blobs` and, on a best-effort basis, parses `Records` to learn
+each cached page's request URL and to find small pages that WebKit stores inside
+the record itself. Future Safari releases may still require updates; records
+the tool cannot parse are skipped.
 
 ## Development
 

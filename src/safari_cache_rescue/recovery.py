@@ -4,11 +4,13 @@ import html
 import json
 import os
 import re
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
+from . import cache_records
 from .history import HistoryReader, HistoryUnavailable
 from .models import BlobSource, Candidate, HistoryEntry
 
@@ -185,12 +187,14 @@ def domain_from_html(text: str) -> str:
     return domain_from_url(canonical_url_from_html(text))
 
 
-def read_stable(path: Path) -> Optional[bytes]:
+def read_stable(path: Path, offset: int = 0) -> Optional[bytes]:
+    """Read the bytes of ``path`` from ``offset``, or ``None`` if not HTML or changed while reading."""
     try:
         before = path.stat()
-        if before.st_size <= 0 or before.st_size > MAX_HTML_BYTES:
+        if before.st_size <= offset or before.st_size > MAX_HTML_BYTES:
             return None
         with path.open("rb") as handle:
+            handle.seek(offset)
             prefix = handle.read(65536)
             if not looks_like_html(prefix):
                 return None
@@ -201,7 +205,96 @@ def read_stable(path: Path) -> Optional[bytes]:
         return None
     identity_before = (before.st_ino, before.st_size, before.st_mtime_ns)
     identity_after = (after.st_ino, after.st_size, after.st_mtime_ns)
-    return data if identity_before == identity_after and len(data) == before.st_size else None
+    if identity_before != identity_after or len(data) != before.st_size:
+        return None
+    return data[offset:]
+
+
+def _read_record(path: Path) -> Optional[bytes]:
+    try:
+        if path.stat().st_size > MAX_HTML_BYTES:
+            return None
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _record_files(records_dir: Path) -> List[Path]:
+    files: List[Path] = []
+    with os.scandir(records_dir) as partitions:
+        for partition in partitions:
+            if not partition.is_dir(follow_symlinks=False):
+                continue
+            try:
+                with os.scandir(os.path.join(partition.path, "Resource")) as entries:
+                    for entry in entries:
+                        if entry.is_file(follow_symlinks=False) and not entry.name.endswith("-blob"):
+                            files.append(Path(entry.path))
+            except FileNotFoundError:
+                continue
+    return files
+
+
+def scan_cache_version(version_dir: Path) -> Tuple[List[BlobSource], int]:
+    """Return the HTML-capable bodies of one ``Version N`` directory and how many parts were unreadable.
+
+    ``Blobs`` files become sources; ``Records`` add the request URL to the blob
+    they reference, and bodies stored inline in a record become sources of their own.
+    """
+    version = version_dir.name
+    denied = 0
+    blobs: Dict[str, BlobSource] = {}
+    blob_by_inode: Dict[int, str] = {}
+    try:
+        with os.scandir(version_dir / "Blobs") as entries:
+            for entry in entries:
+                if entry.is_file(follow_symlinks=False):
+                    blobs[entry.name] = BlobSource(Path(entry.path), version)
+                    blob_by_inode[entry.inode()] = entry.name
+    except FileNotFoundError:
+        pass
+    except OSError:
+        denied += 1
+
+    blob_by_hash: Dict[bytes, str] = {}
+    for name in blobs:
+        if len(name) == 40:
+            try:
+                blob_by_hash[bytes.fromhex(name)] = name
+            except ValueError:
+                pass
+
+    try:
+        record_paths = _record_files(version_dir / "Records")
+    except FileNotFoundError:
+        record_paths = []
+    except OSError:
+        denied += 1
+        record_paths = []
+
+    inline: List[BlobSource] = []
+    for record_path in record_paths:
+        data = _read_record(record_path)
+        if not data:
+            continue
+        url, url_end = cache_records.record_url(data)
+        if not url:
+            continue
+        name: Optional[str] = None
+        try:
+            name = blob_by_inode.get(os.stat(str(record_path) + "-blob").st_ino)
+        except OSError:
+            pass
+        if name is None and blob_by_hash:
+            linked = cache_records.linked_blob_hash(data, url_end, blob_by_hash)
+            name = blob_by_hash.get(linked) if linked else None
+        if name is not None:
+            blobs[name] = replace(blobs[name], url=url)
+            continue
+        offset = cache_records.inline_body_offset(data, url_end)
+        if offset is not None:
+            inline.append(BlobSource(record_path, version, url=url, offset=offset))
+    return list(blobs.values()) + inline, denied
 
 
 class RecoveryEngine:
@@ -226,20 +319,14 @@ class RecoveryEngine:
                 with os.scandir(root):
                     pass
                 readable_root = True
-                version_dirs = sorted(root.glob("Version */Blobs"))
+                version_dirs = sorted(path for path in root.glob("Version *") if path.is_dir())
             except (PermissionError, OSError):
                 denied += 1
                 continue
-            for blobs_dir in version_dirs:
-                try:
-                    with os.scandir(blobs_dir) as entries:
-                        for entry in entries:
-                            if entry.is_file(follow_symlinks=False):
-                                sources.append(
-                                    BlobSource(Path(entry.path), blobs_dir.parent.name)
-                                )
-                except (PermissionError, OSError):
-                    denied += 1
+            for version_dir in version_dirs:
+                version_sources, version_denied = scan_cache_version(version_dir)
+                sources.extend(version_sources)
+                denied += version_denied
         if denied and sources:
             self.warnings.append("One Safari cache location could not be read")
         if not sources and denied and not readable_root:
@@ -331,7 +418,7 @@ class RecoveryEngine:
         ]
 
         for source in sources if sources is not None else self.blob_sources():
-            data = read_stable(source.path)
+            data = read_stable(source.path, source.offset)
             if data is None:
                 continue
             text = decode_html(data)
@@ -341,6 +428,7 @@ class RecoveryEngine:
             lowered = text.casefold() if query_normalized and not is_url_query else ""
             canonical_url = canonical_url_from_html(text)
             canonical_identity = normalize_url_identity(canonical_url)
+            record_identity = normalize_url_identity(source.url)
             normalized_title = normalize(title)
             title_tokens = set(meaningful_tokens(title))
             complete = is_complete_html(text)
@@ -350,11 +438,18 @@ class RecoveryEngine:
             exact_url = False
             exact_title = False
             title_overlap = False
-            if query_url and query_url == canonical_identity:
+            if query_url and query_url == record_identity:
+                exact_url = True
+                reasons.append("cache record URL matches query")
+            elif query_url and query_url == canonical_identity:
                 exact_url = True
                 reasons.append("canonical URL matches query")
             for entry, entry_url, history_title, history_tokens in prepared_entries:
-                if canonical_identity and entry_url == canonical_identity:
+                if record_identity and entry_url == record_identity:
+                    exact_url = True
+                    matched_entries.append(entry)
+                    reasons.append("cache record URL matches Safari history")
+                elif canonical_identity and entry_url == canonical_identity:
                     exact_url = True
                     matched_entries.append(entry)
                     reasons.append("canonical URL matches Safari history")
@@ -407,6 +502,7 @@ class RecoveryEngine:
             matched_entry = max(matched_entries, key=lambda item: item.visit_time) if matched_entries else None
             domain = (
                 query_domain
+                or domain_from_url(source.url)
                 or (domain_from_url(matched_entry.url) if matched_entry else "")
                 or domain_from_url(canonical_url)
             )
@@ -443,7 +539,7 @@ class RecoveryEngine:
 
         matches: Dict[str, Tuple[BlobSource, bytes, str]] = {}
         for source in self.blob_sources():
-            data = read_stable(source.path)
+            data = read_stable(source.path, source.offset)
             if data is None:
                 continue
             digest = hashlib.sha256(data).hexdigest()
@@ -475,7 +571,9 @@ class RecoveryEngine:
                 "candidate_id": digest,
                 "sha256": digest,
                 "title": title,
-                "domain": self._domain_for_title(title) or domain_from_html(text),
+                "domain": domain_from_url(source.url)
+                or self._domain_for_title(title)
+                or domain_from_html(text),
                 "cache_version": source.cache_version,
                 "byte_length": len(data),
                 "recovered_at": datetime.now().astimezone().isoformat(),
